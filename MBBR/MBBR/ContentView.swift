@@ -8,27 +8,17 @@
 import SwiftUI
 
 struct ContentView: View {
+    
+    @ParsedBackup private var data
+    
     var body: some View {
         VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundColor(.accentColor)
-            Text("Hello, world!")
+            Text(String(describing: self.data.data?.posts.count ?? -1))
         }
         .padding()
-        .task {
+        .onAppear {
             let url = URL(string: "file:///Users/jeffberg/Downloads/jeffreybergier_aad4eb.bar/feed.json")!
-            let parser = Parser(feedJSONURL: url)
-            let blog = try! await parser.decode()
-            print(blog.posts.count)
-            
-//            let before: [Int] = (0...10_000).map { $0 }
-//            let after = await before.parallelMap { "::\($0)::" }
-//            print(after)
-//            print("done")
-        }
-        .onAppear() {
-
+            self.data.url = url
         }
     }
 }
