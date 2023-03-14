@@ -61,99 +61,109 @@ public struct MicroBlog {
 }
 
 
-public struct Parser {
+public enum Parser {
     
     public static var imageExtensions: Set<String> = ["png", "jpg", "jpeg"]
     private static let calendar = Calendar(identifier: .gregorian)
-    private static let timeZone = TimeZone.gmt
+    private static let timeZone = TimeZone(identifier: "GMT")!
     private static let dateFormatter = ISO8601DateFormatter()
     
-    public var feedJSONURL: URL
-    public var baseURL: URL { self.feedJSONURL.deletingLastPathComponent() }
-    
-    public init(feedJSONURL: URL) {
-        self.feedJSONURL = feedJSONURL
-    }
-    
-    public func decode() async throws -> MicroBlog {
-        let output = try await self.step0_decode()
-        return output
-    }
-    
-    private func step0_decode() async throws -> MicroBlog {
-        let data     = try Data(contentsOf: self.feedJSONURL)
-        let raw      = try JSONDecoder().decode(RAW_MicroBlog.self, from: data)
-        var output   = raw.clean
-        output.posts = try await raw.items.parallelMap { rawPost in
-            var post = try self.step1_generatePost(for: rawPost)
-            post.attachments = try self.step2_generateAttachments(for: post.contentRich,
-                                                                  postURL: post.webURL,
-                                                                  publishDate: post.datePublished)
-            return post
+    public static func decode(fromJSONURL jsonURL: URL, completion: @escaping (Result<MicroBlog, Error>) -> Void) {
+        do {
+            let baseURL = jsonURL.deletingLastPathComponent()
+            let rawData = try self.MAINTHREAD_decodeRAW(fromJSONURL: jsonURL)
+            rawData.1.queueMap(priority: .userInitiated) { rawPost, richContent, htmlData in
+                try self.BACKGROUND_cleanPost(for: rawPost, with: richContent, htmlData: htmlData, baseURL: baseURL)
+            } completion: { result in
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success(let posts):
+                        var output = rawData.0.clean
+                        output.posts = posts
+                        completion(.success(output))
+                    case .failure(let error):
+                        completion(.failure(error))
+                    }
+                }
+            }
+        } catch {
+            completion(.failure(error))
         }
-        return output
+    }
+    
+    internal static func MAINTHREAD_decodeRAW(fromJSONURL jsonURL: URL) throws -> (RAW_MicroBlog, [(RAW_MicroBlog.RAW_Post, NSAttributedString, Data)]) {
+        let data      = try Data(contentsOf: jsonURL)
+        let rawBlog   = try JSONDecoder().decode(RAW_MicroBlog.self, from: data)
+        let baseURL   = jsonURL.deletingLastPathComponent()
+        let rawPosts  = try rawBlog.items.map { try self.generateAttributedStrings(for: $0, baseURL: baseURL) }
+        return (rawBlog, rawPosts)
     }
     
     /// Returns a new post but with no attachments. Do that later
-    private func step1_generatePost(for raw: RAW_MicroBlog.RAW_Post) throws -> MicroBlog.Post {
+    private static func generateAttributedStrings(for raw: RAW_MicroBlog.RAW_Post, baseURL: URL) throws -> (RAW_MicroBlog.RAW_Post, NSAttributedString, Data) {
         precondition(Thread.isMainThread)
         guard
             let htmlData = raw.content_html.data(using: .utf16),
             let richString = NSAttributedString(html: htmlData,
-                                                baseURL: self.baseURL,
+                                                baseURL: baseURL,
                                                 documentAttributes: nil)
         else {
             throw NSError(domain: "com.saturdayapps.MBBR.parser", code: -1001)
         }
-        guard let date = Parser.dateFormatter.date(from: raw.date_published) else {
-            throw NSError(domain: "com.saturdayapps.MBBR.parser", code: -1002)
-        }
-        return .init(webURL: raw.url,
-                     datePublished: date,
-                     attachments: .init(),
-                     contentPlain: richString.string,
-                     contentRich: richString,
-                     contentHTML: htmlData)
+        return (raw, richString, htmlData)
     }
     
-    private func step2_generateAttachments(for contentRich: NSAttributedString, postURL: URL, publishDate: Date) throws -> MicroBlog.Post.Attachments {
-        let range = NSRange(location: 0, length: contentRich.length)
-        var output: MicroBlog.Post.Attachments = .init()
-        var outputError: Error?
-        contentRich.enumerateAttributes(in: range, options: []) { keys, range, stop in
+    internal static func BACKGROUND_cleanPost(for rawPost: RAW_MicroBlog.RAW_Post, with richContent: NSAttributedString, htmlData: Data, baseURL: URL) throws -> MicroBlog.Post {
+        // get the date and URL
+        let postURL = rawPost.url
+        guard let datePublished = Parser.dateFormatter.date(from: rawPost.date_published) else {
+            throw NSError(domain: "com.saturdayapps.MBBR.parser", code: -1002)
+        }
+
+        // Process the string for attachments
+        let range = NSRange(location: 0, length: richContent.length)
+        var attachment: MicroBlog.Post.Attachments = .init()
+        var attachmentError: Error?
+        richContent.enumerateAttributes(in: range, options: []) { keys, range, stop in
             // Link attachment finding code
             if let link = keys[.link] as? URL {
-                if let link = self.step3_localImageURL(from: link, postURL: postURL) {
-                    output.imageURL.insert(link)
+                if let link = self.cleanPost_localImageURL(from: link, postURL: postURL, baseURL: baseURL) {
+                    attachment.imageURL.insert(link)
                 } else {
                     // Don't know what this is, so just drop it in as-is
-                    output.webURL.insert(link)
+                    attachment.webURL.insert(link)
                 }
             }
             // Image attachment finding code
-            if let attachment = keys[.attachment] as? NSTextAttachment,
-               let fileName = attachment.fileWrapper?.preferredFilename
+            if let textAttachment = keys[.attachment] as? NSTextAttachment,
+               let fileName = textAttachment.fileWrapper?.preferredFilename
             {
                 do {
-                    let link = try self.step4_generateFakeFileURL(fileName: fileName,
-                                                                  publishDate: publishDate)
-                    output.imageURL.insert(link)
+                    let link = try self.cleanPost_generateFakeFileURL(fileName: fileName,
+                                                                      publishDate: datePublished,
+                                                                      baseURL: baseURL)
+                    attachment.imageURL.insert(link)
                 } catch {
-                    outputError = error
+                    attachmentError = error
                     stop.pointee = true
                 }
             }
         }
         
-        if let outputError {
-            throw outputError
+        if let attachmentError {
+            throw attachmentError
         }
         
-        return output
+        return .init(webURL: postURL,
+                     datePublished: datePublished,
+                     attachments: attachment,
+                     contentPlain: richContent.string,
+                     contentRich: richContent,
+                     contentHTML: htmlData)
     }
     
     /// generates local URL from complete Web URL
-    private func step3_localImageURL(from linkURL: URL, postURL: URL) -> URL? {
+    private static func cleanPost_localImageURL(from linkURL: URL, postURL: URL, baseURL: URL) -> URL? {
         let linkExt  = linkURL.pathExtension
         let linkPath = linkURL.path
         guard
@@ -161,7 +171,7 @@ public struct Parser {
             linkHost == postURL.host,
             Parser.imageExtensions.contains(linkExt)
         else { return nil }
-        let output = self.baseURL.appending(path: linkPath)
+        let output = baseURL.appendingPathComponent(linkPath)
         #if DEBUG
         if ((try? output.checkResourceIsReachable()) ?? false) == false {
             NSLog("Couldn't Find Image: \(output)")
@@ -171,13 +181,13 @@ public struct Parser {
     }
     
     
-    private func step4_generateFakeFileURL(fileName: String, publishDate: Date) throws -> URL {
+    private static func cleanPost_generateFakeFileURL(fileName: String, publishDate: Date, baseURL: URL) throws -> URL {
         let components = Parser.calendar.dateComponents(in: Parser.timeZone, from: publishDate)
         let yearString = String(components.year ?? -1)
-        let output = self.baseURL
-            .appending(path: "uploads", directoryHint: .isDirectory)
-            .appending(path: yearString, directoryHint: .isDirectory)
-            .appending(path: fileName, directoryHint: .notDirectory)
+        let output = baseURL
+            .appendingPathComponent("uploads")
+            .appendingPathComponent(yearString)
+            .appendingPathComponent(fileName)
         #if DEBUG
         if ((try? output.checkResourceIsReachable()) ?? false) == false {
             NSLog("Couldn't Find Image: \(output)")
@@ -199,25 +209,33 @@ extension Sequence {
 }
 
 extension RandomAccessCollection {
-    /// Processes a map in parallel and returns the transformed collection in the same order
-    internal func parallelMap<T>(priority: TaskPriority = .userInitiated,
-                                 _ transform: @escaping (Element) async throws -> T) async rethrows -> [T]
-    {
-        typealias TransformTuple = (Int, T)
-        return try await withThrowingTaskGroup(of: TransformTuple.self) { group in
-            var output: [T?] = .init(repeating: nil, count: self.count)
-            for (idx, element) in self.enumerated() {
-                group.addTask(priority: priority) {
-                    let transformed = try await transform(element)
-                    return (idx, transformed)
+    
+    /// Transforms a collection with a concurrent queue. Collection is guaranteed to be in correct order. If a transform throws an error, the entire operation is abandoned. Completion called on arbitrary serial queue.
+    internal func queueMap<T>(priority: DispatchQoS, transform: @escaping (Element) throws -> T, completion: @escaping (Result<[T], Error>) -> Void) {
+        let transformQueue = DispatchQueue(label: "RandomAccessCollection.QeueuMap.Transform", qos: priority, attributes: .concurrent)
+        let writeQueue = DispatchQueue(label: "RandomAccessCollection.QeueuMap.WriteQueue", qos: priority)
+        var output: [T?] = .init(repeating: nil, count: self.count)
+        var count = 0
+        var stop = false
+        for (idx, element) in self.enumerated() {
+            guard stop == false else { break }
+            transformQueue.async {
+                do {
+                    let transformed = try transform(element)
+                    writeQueue.sync {
+                        output[idx] = transformed
+                        count += 1
+                        guard count >= self.count else { return }
+                        stop = true
+                        completion(.success(output as! [T]))
+                    }
+                } catch {
+                    writeQueue.sync {
+                        stop = true
+                        completion(.failure(error))
+                    }
                 }
             }
-            // Tasks return in order done, not in the order requested.
-            // Using Enumerated and Tuple allows them to be placed in order.
-            for try await transformedTuple in group {
-                output[transformedTuple.0] = transformedTuple.1
-            }
-            return output as! [T]
         }
     }
 }
